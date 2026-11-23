@@ -2868,6 +2868,10 @@ function ComposerImpl(
   // Attachments — same hook as the landing composer; the live composer's
   // own side effects (dirty tracking, desktop refocus) stay in the
   // callbacks so the hook never learns about sessions or focus.
+  // The chip inserter comes from useMentionBrowser, set up further down.
+  const attachPastedFilesRef = useRef<(files: File[], target: ComposerTextTarget) => void>(
+    () => {},
+  );
   const {
     files,
     attachmentError,
@@ -2889,6 +2893,10 @@ function ComposerImpl(
     onRemoved: () => {
       dirtyRef.current = true;
     },
+    onPasteChips:
+      composerEngine === "codemirror"
+        ? (pasted, target) => attachPastedFilesRef.current(pasted, target)
+        : undefined,
   });
   const filesRef = useRef(files);
   filesRef.current = files;
@@ -3206,6 +3214,8 @@ function ComposerImpl(
     openMentionDir,
     mentionedSessions,
     attachSession,
+    attachPastedFiles,
+    mentionedAttachments,
     mentionTokens,
     tagFiles,
     ownedMentionTokens,
@@ -3240,6 +3250,15 @@ function ComposerImpl(
     [mentionedItems, mentionedSessions, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
+  attachPastedFilesRef.current = attachPastedFiles;
+  // Pasted chips send their files with the tray's; a chip's file goes only while its token is in the draft.
+  const attachedFiles = [
+    ...files,
+    ...presentMentions(mentionedAttachments, [
+      draft.text,
+      ...draft.quotes.map((quote) => quote.before),
+    ]).map((attachment) => attachment.file),
+  ];
   const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
   // Review comments are appended at send, which can make a bare `!` a command.
   const outgoingClassifyText = useMemo(
@@ -3254,12 +3273,12 @@ function ComposerImpl(
     value,
     commandNames: slashCommandNames,
     // With context the text goes out as typed, so only exact-case commands run.
-    anyCaseCommandNames: carriesMessageContext(draft, files, sendContext)
+    anyCaseCommandNames: carriesMessageContext(draft, attachedFiles, sendContext)
       ? []
       : anyCaseBuiltinNames,
-    enabled: draft.quotes.length === 0 && files.length === 0,
+    enabled: draft.quotes.length === 0 && attachedFiles.length === 0,
     // Files go out as separate blocks, so the message is no longer a lone `!` text.
-    shellEnabled: files.length === 0,
+    shellEnabled: attachedFiles.length === 0,
     nativeShell,
     refusedNativeShell: permissionPending
       ? null
@@ -3271,7 +3290,10 @@ function ComposerImpl(
     sendContext: { ...sendContext, quotes: draft.quotes },
   });
   const hasDraft =
-    fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
+    fullText.trim().length > 0 ||
+    attachedFiles.length > 0 ||
+    hasMentions ||
+    localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -3282,7 +3304,11 @@ function ComposerImpl(
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // tagged items and inline tokens, deduping against what's already tagged,
   // then clear the store queue so they aren't re-applied.
-  taggedMentionsRef.current = { files: mentionedItems, sessions: mentionedSessions };
+  taggedMentionsRef.current = {
+    files: mentionedItems,
+    sessions: mentionedSessions,
+    attachments: mentionedAttachments,
+  };
   restoreTaggedMentionsRef.current = resetMentions;
   // Read at drain time without re-running the effect on every keystroke.
   const tagFilesRef = useRef(tagFiles);
@@ -3798,7 +3824,7 @@ function ComposerImpl(
     mobile: isMobile,
     mobileEnterCompletes: false,
     escapeClearsOnlyWithContent: true,
-    allowOpen: inputFocused && draft.quotes.length === 0 && files.length === 0,
+    allowOpen: inputFocused && draft.quotes.length === 0 && attachedFiles.length === 0,
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
@@ -3988,7 +4014,10 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
+      (!trimmed &&
+        attachedFiles.length === 0 &&
+        !hasMentions &&
+        localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -4007,7 +4036,7 @@ function ComposerImpl(
     const opensGenericSideChat =
       cmd === "/side" &&
       !usesNativeSideChatFork(sessionHarness) &&
-      !carriesMessageContext(draft, files, sendContext) &&
+      !carriesMessageContext(draft, attachedFiles, sendContext) &&
       (skill === null || skill.command === parts[0]);
     if (
       opensGenericSideChat &&
@@ -4054,7 +4083,7 @@ function ComposerImpl(
     let goalMessage: string | null = null;
     if (
       (skill !== null || isSlashCommandText(trimmed)) &&
-      !carriesMessageContext(draft, files, sendContext)
+      !carriesMessageContext(draft, attachedFiles, sendContext)
     ) {
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
@@ -4149,7 +4178,7 @@ function ComposerImpl(
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
     if (trimmed) appendEntry(fullText, storedReplyDraft);
-    const sendFiles = files.length > 0 ? files : undefined;
+    const sendFiles = attachedFiles.length > 0 ? attachedFiles : undefined;
     if (draft.quotes.length > 0) {
       onSend(outgoing.text, sendFiles, outgoing.replyDraft);
     } else {
@@ -4263,7 +4292,10 @@ function ComposerImpl(
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
   const composerEmptyForRecall =
-    fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
+    fullText === "" &&
+    attachedFiles.length === 0 &&
+    !hasMentions &&
+    localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4510,7 +4542,7 @@ function ComposerImpl(
       <ChatComposer
         appearance={isMobile ? "glass" : "default"}
         hasContent={
-          files.length > 0 ||
+          attachedFiles.length > 0 ||
           hasMentions ||
           attachmentError !== null ||
           commandError !== null ||
