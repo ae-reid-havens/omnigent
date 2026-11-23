@@ -21,6 +21,7 @@ import type { ChangedSort } from "../FlatFileList";
 import { useFocusedFileSource } from "../fileCommands/focusedFile";
 import { useFileCommandTarget } from "../fileCommands/target";
 import { FileCommandMenuAt } from "../fileCommands/useFileCommandMenu";
+import { RevealBaseContext } from "../RevealInFileManager";
 import type { FolderListing } from "../folderTreeSync";
 import {
   type TreeChange,
@@ -115,6 +116,15 @@ const FILES_TREE_THEME = {
 } as CSSProperties;
 
 export function FilesTree(props: FilesTreeProps) {
+  // Row paths are relative to the browsed folder; file commands resolve them against it.
+  return (
+    <RevealBaseContext.Provider value={props.browseLocation}>
+      <FilesTreeRows {...props} />
+    </RevealBaseContext.Provider>
+  );
+}
+
+function FilesTreeRows(props: FilesTreeProps) {
   const { conversationId, browseLocation, showHidden, refreshToken } = props;
   const cacheKey = cacheKeyFor(conversationId, browseLocation);
   const dark = useResolvedThemeMode() === "dark";
