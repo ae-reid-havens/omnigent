@@ -347,6 +347,8 @@ export interface ListDirectoryOptions {
 }
 
 const LIST_PAGE_SIZE = 1000;
+/** The ListDirectory feature that marks, and can leave out, what Git ignores. */
+const IGNORED_FEATURE = "gitignore";
 
 async function listDirectory(
   client: WorkspaceClient,
@@ -384,6 +386,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
+  /** Read the route's capabilities for `call` even when `method` needs none. */
+  readCapabilities?: boolean;
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -405,16 +409,17 @@ interface CallOptions {
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
-  call: (client: WorkspaceClient) => Promise<T>,
+  call: (client: WorkspaceClient, served: ReadonlySet<string>) => Promise<T>,
   {
     signal,
     sshTarget,
     features = [],
+    readCapabilities = false,
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
 ): Promise<T | null> {
-  const checked = !BASELINE_METHODS.has(method) || features.length > 0;
+  const gated = !BASELINE_METHODS.has(method) || features.length > 0;
   // Each route's attempt must finish before the next is tried.
   /* oxlint-disable no-await-in-loop */
   for (const route of routesFor(sessionId, sshTarget)) {
@@ -422,12 +427,21 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
-      if (checked) {
-        const served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+      let served: ReadonlySet<string> = NOTHING_SERVED;
+      if (gated || readCapabilities) {
+        served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
-        if (!required.every((name) => served.has(name))) continue;
+        if (gated && !required.every((name) => served.has(name))) continue;
       }
-      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
+      const routeServed = served;
+      return await callOn(
+        route,
+        sessionId,
+        (client) => call(client, routeServed),
+        signal,
+        sshTarget,
+        answerCodes,
+      );
     } catch (error) {
       signal?.throwIfAborted();
       if (error instanceof UnusableAnswerError) {
@@ -447,7 +461,7 @@ async function viaWorkspaceApi<T>(
         continue;
       }
       // The host listed a method it doesn't serve, e.g. one the server turned off.
-      if (checked && code === Code.Unimplemented) {
+      if (gated && code === Code.Unimplemented) {
         unsupportedUntil.set(unsupportedKey, Date.now() + ROUTE_RETRY_MS);
         continue;
       }
@@ -458,6 +472,8 @@ async function viaWorkspaceApi<T>(
   return null;
 }
 
+const NOTHING_SERVED: ReadonlySet<string> = new Set();
+
 /**
  * List a workspace directory through the workspace API, in the REST listing's
  * shape and order (ascending by path), reading pages up to `maxEntries`.
@@ -466,7 +482,7 @@ async function viaWorkspaceApi<T>(
  * :param path: Workspace-relative directory, ``""`` for the root.
  * :param maxEntries: Stop after this many entries, e.g. ``1000``; must be positive.
  * :param options: ``hideIgnored`` leaves out what Git ignores, where the host can tell.
- * :returns: The entries and whether more remain, or null when the caller
+ * :returns: The entries, whether more remain and whether Git-ignored ones were left out, or null when the caller
  *     should list through REST (see :func:`readFileViaWorkspaceApi`).
  */
 export function listDirectoryViaWorkspaceApi(
@@ -475,14 +491,22 @@ export function listDirectoryViaWorkspaceApi(
   maxEntries: number,
   signal?: AbortSignal,
   { hideIgnored = false }: Omit<ListDirectoryOptions, "signal"> = {},
-): Promise<{ data: ListedEntry[]; hasMore: boolean } | null> {
+): Promise<{ data: ListedEntry[]; hasMore: boolean; ignoredHidden?: true } | null> {
   // The host reads a page size of 0 as its default, so a 0 limit would still return entries.
   if (!(maxEntries > 0)) return Promise.reject(new RangeError("maxEntries must be positive"));
   return viaWorkspaceApi(
     sessionId,
     "listDirectory",
-    (client) => listDirectory(client, path, maxEntries, { signal, hideIgnored }),
-    { signal },
+    async (client, served) => {
+      // Only a host offering the feature leaves ignored entries out; others list them all.
+      const ignoredHidden = hideIgnored && served.has(IGNORED_FEATURE);
+      const listed = await listDirectory(client, path, maxEntries, {
+        signal,
+        hideIgnored: ignoredHidden,
+      });
+      return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
+    },
+    { signal, readCapabilities: hideIgnored },
   );
 }
 
