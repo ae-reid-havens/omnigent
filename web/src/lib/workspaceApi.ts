@@ -286,6 +286,41 @@ function routeCapabilities(
   return entry.pending;
 }
 
+const NO_CAPABILITIES: ReadonlySet<string> = new Set();
+// Failures of the route that carried GetCapabilities, not answers from its host.
+const ROUTE_FAILURE_CODES: ReadonlySet<Code> = new Set([
+  Code.Unavailable,
+  Code.Canceled,
+  Code.DeadlineExceeded,
+  Code.Unauthenticated,
+  Code.Unknown,
+]);
+
+/**
+ * A route's capabilities for a baseline method that only uses optional features: a host
+ * that answers GetCapabilities with an error still serves the method, just without them,
+ * for as long as an Unimplemented answer would be kept. A route that can't be reached
+ * fails, so the caller moves on to the next one.
+ */
+async function optionalCapabilities(
+  route: Route,
+  sessionId: string,
+  sshTarget: string | null | undefined,
+  signal: AbortSignal | undefined,
+): Promise<ReadonlySet<string>> {
+  try {
+    return await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (!(error instanceof ConnectError) || ROUTE_FAILURE_CODES.has(error.code)) throw error;
+    capabilities.set(routeKey(route, sessionId, sshTarget), {
+      pending: Promise.resolve(NO_CAPABILITIES),
+      expiresAtMs: Date.now() + ROUTE_RETRY_MS,
+    });
+    return NO_CAPABILITIES;
+  }
+}
+
 function concat(chunks: Uint8Array[]): Uint8Array {
   const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
   let offset = 0;
@@ -386,8 +421,8 @@ interface CallOptions {
   sshTarget?: string | null;
   /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
   features?: readonly string[];
-  /** Read the route's capabilities for `call` even when `method` needs none. */
-  readCapabilities?: boolean;
+  /** Optional features the call uses when the route's host lists them; `call` is told which. */
+  usesFeatures?: readonly string[];
   /** Codes that answer the request rather than fail the route. */
   answerCodes?: ReadonlySet<Code>;
   /** Throw an answer to the caller, for methods REST can't answer instead. */
@@ -414,12 +449,12 @@ async function viaWorkspaceApi<T>(
     signal,
     sshTarget,
     features = [],
-    readCapabilities = false,
+    usesFeatures = [],
     answerCodes = ANSWER_CODES,
     throwAnswers = false,
   }: CallOptions = {},
 ): Promise<T | null> {
-  const gated = !BASELINE_METHODS.has(method) || features.length > 0;
+  const checked = !BASELINE_METHODS.has(method) || features.length > 0;
   // Each route's attempt must finish before the next is tried.
   /* oxlint-disable no-await-in-loop */
   for (const route of routesFor(sessionId, sshTarget)) {
@@ -427,17 +462,18 @@ async function viaWorkspaceApi<T>(
     const unsupportedKey = `${key}:${method}`;
     if ((unsupportedUntil.get(unsupportedKey) ?? 0) > Date.now()) continue;
     try {
-      let served: ReadonlySet<string> = NOTHING_SERVED;
-      if (gated || readCapabilities) {
+      let served: ReadonlySet<string> = NO_CAPABILITIES;
+      if (checked) {
         served = await abortable(routeCapabilities(route, sessionId, sshTarget), signal);
         const required = [capabilityName(method), ...features];
-        if (gated && !required.every((name) => served.has(name))) continue;
+        if (!required.every((name) => served.has(name))) continue;
+      } else if (usesFeatures.length > 0) {
+        served = await optionalCapabilities(route, sessionId, sshTarget, signal);
       }
-      const routeServed = served;
       return await callOn(
         route,
         sessionId,
-        (client) => call(client, routeServed),
+        (client) => call(client, served),
         signal,
         sshTarget,
         answerCodes,
@@ -461,7 +497,7 @@ async function viaWorkspaceApi<T>(
         continue;
       }
       // The host listed a method it doesn't serve, e.g. one the server turned off.
-      if (gated && code === Code.Unimplemented) {
+      if (checked && code === Code.Unimplemented) {
         unsupportedUntil.set(unsupportedKey, Date.now() + ROUTE_RETRY_MS);
         continue;
       }
@@ -471,8 +507,6 @@ async function viaWorkspaceApi<T>(
   /* oxlint-enable no-await-in-loop */
   return null;
 }
-
-const NOTHING_SERVED: ReadonlySet<string> = new Set();
 
 /**
  * List a workspace directory through the workspace API, in the REST listing's
@@ -506,7 +540,7 @@ export function listDirectoryViaWorkspaceApi(
       });
       return ignoredHidden ? { ...listed, ignoredHidden: true as const } : listed;
     },
-    { signal, readCapabilities: hideIgnored },
+    { signal, usesFeatures: hideIgnored ? [IGNORED_FEATURE] : [] },
   );
 }
 
