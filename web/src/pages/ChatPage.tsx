@@ -281,7 +281,9 @@ import { formatStatusModelLabel, formatModelEffortStatusLabel } from "@/lib/comp
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { RewindPicker } from "@/components/RewindPicker";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
-import { MainTerminalView } from "@/shell/MainTerminalView";
+import { ChatPaneBody } from "@/shell/ChatPaneBody";
+import { MainTerminalSurface } from "@/shell/MainTerminalSurface";
+import { useChatInPanes } from "@/shell/panesViewGate";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
@@ -1633,6 +1635,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // including stopped/resumable sessions, and the connection indicator
   // remains below it for offline sessions.
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
+  // With the panes view, a split beside the chat stays on screen in Chat, the chat in its pane.
+  const {
+    inPanes: chatInPanes,
+    host: chatPaneHost,
+    marked: chatMarked,
+  } = useChatInPanes(conversationId, !showTerminal);
   useMessageDeepLinkChatView(conversationId);
 
   // All hook calls below must run on every render regardless of
@@ -1843,7 +1851,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   }, [conversationId, liveness.kind, onShowReconnectHelp]);
   const terminalSurfaces = renderedTerminals.map((entry) => {
     const isActive = mountTerminal && entry.conversationId === conversationId;
-    const isShown = isActive && showTerminal;
+    const isShown = isActive && (showTerminal || chatInPanes);
     return (
       <div
         key={entry.conversationId}
@@ -1852,7 +1860,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
         className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
         aria-hidden={!isShown}
       >
-        <MainTerminalView
+        <MainTerminalSurface
           conversationId={entry.conversationId}
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
@@ -1863,8 +1871,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
           splittable
+          chatShown={isActive && !showTerminal}
         />
-        {isShown && (
+        {/* With the chat in its pane, the chat's own indicator shows below it. */}
+        {isShown && !chatInPanes && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
         )}
       </div>
@@ -1882,7 +1892,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     <>
       {terminalSurfaces}
       {!showTerminal && (
-        <>
+        <ChatPaneBody sessionId={conversationId ?? ""} host={chatPaneHost} marked={chatMarked}>
           {/* The scrolling transcript column owns every streaming-hot store
           subscription and the bubble pipeline, so an SSE frame re-renders it
           alone — this surface's composer and chrome below bail out. */}
@@ -1972,7 +1982,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           Sits below the composer so its position is consistent with the
           terminal view. */}
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        </>
+        </ChatPaneBody>
       )}
     </>
   );
